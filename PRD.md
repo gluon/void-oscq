@@ -1,0 +1,402 @@
+# Void OSCQ: Product Requirements Document
+
+Status: v1 spec, locked for implementation.
+Audience: the engineer (human or agent) implementing the app from scratch.
+Working name: `void-oscq` (binary `void-oscq`, app display name "Void OSCQ"). Renaming is a single find and replace; do not redesign around a new name.
+
+Read this whole document before writing code. Everything marked LOCKED is a decision, not a suggestion. Everything marked VERIFY must be checked against a primary source before you rely on it, and the result written into `docs/protocol-notes.md`.
+
+---
+
+## 1. Problem
+
+OSCQuery lets an application publish its OSC address space as JSON over HTTP, so other tools can discover and drive it with no manual setup. The reference client, Vidvox OSCQuery Browser, is macOS only, Cocoa, and deliberately one way: it sends OSC and never observes the remote state. Its tree widget also degrades on large address spaces, which is exactly what the interesting servers (VDMX, ossia, large Max patches) publish.
+
+There is no portable, fast client that both browses an address space and lets you drive it while seeing the truth of what the remote side is doing.
+
+## 2. Goals
+
+1. One native app, same behaviour on macOS, Windows and Linux.
+2. Discover OSCQuery servers on the LAN, and accept a manual host and port.
+3. Render the full address space, including trees of several thousand nodes, with no visible lag.
+4. Show each node's real current value, and keep it live when the server supports the WebSocket part of the protocol.
+5. Let the user edit values with a widget appropriate to the declared type and range, and send the resulting OSC immediately.
+6. Show raw JSON and a timestamped OSC traffic log, for debugging other people's implementations.
+7. Ship as a single self contained binary per platform, started from CI.
+
+## 3. Non goals for v1
+
+Do not build these. They are listed so that the temptation is answered once.
+
+- No layout editor, no user designed control surfaces, no widget scripting. Open Stage Control already exists and does that well. This app renders the server's namespace, it does not invent a UI on top of it.
+- No MIDI of any kind.
+- No OSCQuery server mode. The app is a client. Publishing an address space is what Vidvox OSCQuery Helper does.
+- No mobile or tablet build, no web UI, no remote control of this app by another app.
+- No theming system beyond one dark theme and one light theme following the OS setting.
+- No session or preset persistence beyond the small set described in section 9.7.
+- No plugin system, no embedded scripting language, no automation or sequencing.
+- No code signing or notarisation in v1. The CI produces unsigned artifacts.
+
+Anything that smells like "while we are here, we could also" is out of scope until v1 ships and is used in anger.
+
+## 4. Reference material
+
+- OSCQuery proposal and specification: https://github.com/Vidvox/OSCQueryProposal. This is the normative source. Fetch it in M0 and keep a copy of the relevant parts in `docs/protocol-notes.md`.
+- Vidvox OSCQuery Browser documentation, the app this replaces and must at least equal: https://docs.vidvox.net/oscquery-browser/
+- Vidvox OSCQuery Helper, used as a test server: https://docs.vidvox.net/oscquery-helper/
+- VVOSCQueryProtocol, the reference Objective C implementation, useful when the written spec is ambiguous: https://github.com/Vidvox/VVOpenSource
+- ossia, a second independent implementation to test interoperability against: https://ossia.io
+- Open Stage Control, reference for control widget ergonomics only, explicitly not an architectural model: https://framagit.org/jean-emmanuel/open-stage-control
+
+## 5. Stack, LOCKED
+
+| Concern | Choice | Why |
+| --- | --- | --- |
+| Language | Rust, stable toolchain, edition 2024 | One binary, no runtime to install, predictable latency, same code on three platforms |
+| GUI | `eframe` / `egui` | Immediate mode, no webview, trivial cross compilation, built in virtualised list primitives |
+| Async runtime | `tokio`, multi thread, confined to the network layer | HTTP, WebSocket and timers in one place |
+| HTTP client | `reqwest` with `rustls` TLS backend | No OpenSSL dependency on any platform. OSCQuery is plain HTTP but the TLS free build must still link cleanly |
+| WebSocket | `tokio-tungstenite` with `rustls` | Text frames for commands, binary frames for OSC packets |
+| OSC encode and decode | `rosc` | Mature, no unsafe, covers bundles and all common type tags |
+| mDNS and DNS-SD | `mdns-sd`, pure Rust | Identical on all three platforms, no Avahi or Bonjour SDK to link, no system daemon requirement |
+| JSON | `serde` and `serde_json` | Address space documents are deserialised into typed structs, never walked as untyped values in UI code |
+| Logging | `tracing` with `tracing-subscriber`, env filter | Needed to debug other people's servers |
+| Error type | `thiserror` in library crates, `anyhow` at the binary boundary | Library errors are matched on, application errors are reported |
+| Fuzzy matching | `nucleo-matcher` | Path search over thousands of nodes must stay interactive |
+
+Do not add a dependency that is not in this table without recording the reason in `docs/decisions.md`. In particular: no `egui` widget mega crates, no ORM, no actor framework, no config framework. 
+
+Pin exact versions at implementation time with `cargo add`, then commit `Cargo.lock`. The versions are not written here on purpose, because a stale version number in a PRD is worse than none.
+
+Minimum supported platforms: macOS 12 on aarch64 and x86_64, Windows 10 on x86_64, Linux on x86_64 with glibc 2.31 or newer, X11 and Wayland.
+
+## 6. Architecture, LOCKED
+
+### 6.1 Crate layout
+
+A Cargo workspace with three crates. This split exists so the protocol can be tested without a GUI, and so that a future headless tool can reuse it.
+
+```
+void-oscq/
+  Cargo.toml              workspace
+  crates/
+    oscq-core/            protocol: types, HTTP client, WebSocket client, OSC send
+    oscq-discovery/       mDNS browsing behind a trait, plus manual entry
+    void-oscq/            the eframe application, UI only
+  tests/
+    fixtures/             captured JSON documents from real servers
+  docs/
+    protocol-notes.md
+    decisions.md
+```
+
+`oscq-core` and `oscq-discovery` must not depend on `egui` or `eframe`. If a UI concern leaks into them, the split has failed.
+
+### 6.2 Threading model
+
+Three kinds of thread, with explicit boundaries.
+
+1. The UI thread, owned by `eframe`. It never blocks, never performs I/O, never calls `block_on`. It owns the entire `AppState`.
+2. One `tokio` multi thread runtime, spawned at startup, owning every HTTP request, every WebSocket connection, and the UDP socket used to send OSC.
+3. The `mdns-sd` daemon, which manages its own thread and hands back a receiver.
+
+Communication is message passing in both directions, no shared locks on application state:
+
+- UI to network: `tokio::sync::mpsc::UnboundedSender<Command>`.
+- Network to UI: `crossbeam_channel::Sender<Event>`, drained at the top of every frame in a non blocking loop with a bounded iteration count so a flood cannot starve rendering.
+- Any event that mutates visible state calls `egui::Context::request_repaint()`.
+
+When idle the app must not repaint. Continuous repaint is a bug, not a default.
+
+### 6.3 Command and event vocabulary
+
+This is the contract between the two halves. Extend it deliberately, do not bypass it.
+
+```rust
+enum Command {
+    StartDiscovery,
+    StopDiscovery,
+    Connect { server_id: ServerId, http_base: Url },
+    Disconnect { server_id: ServerId },
+    RefreshTree { server_id: ServerId, from_path: OscPath },
+    RefreshValue { server_id: ServerId, path: OscPath },
+    Listen { server_id: ServerId, path: OscPath },
+    Ignore { server_id: ServerId, path: OscPath },
+    SendOsc { server_id: ServerId, path: OscPath, args: Vec<OscType> },
+}
+
+enum Event {
+    ServerFound(DiscoveredServer),
+    ServerLost(ServerId),
+    HostInfo { server_id: ServerId, info: HostInfo },
+    TreeLoaded { server_id: ServerId, root: Node },
+    SubtreeLoaded { server_id: ServerId, path: OscPath, node: Node },
+    ValueChanged { server_id: ServerId, path: OscPath, value: Vec<OscType> },
+    PathAdded { server_id: ServerId, path: OscPath },
+    PathRemoved { server_id: ServerId, path: OscPath },
+    PathRenamed { server_id: ServerId, old: OscPath, new: OscPath },
+    TransportState { server_id: ServerId, state: TransportState },
+    TrafficLogged(TrafficRecord),
+    Error { server_id: Option<ServerId>, error: UserFacingError },
+}
+```
+
+`ServerId` is an opaque internal identifier, stable for the lifetime of a connection, never a user visible string and never the mDNS instance name.
+
+## 7. Protocol implementation
+
+VERIFY every attribute spelling, every query parameter and every WebSocket command name against the proposal repository in M0 before writing the deserialiser. The list below is the implementation target and is accurate enough to design against, but the repository wins on any disagreement, and any disagreement found must be written into `docs/protocol-notes.md`.
+
+### 7.1 Address space document
+
+A GET on a path returns a JSON object describing that node. Expected keys:
+
+- `FULL_PATH`: the OSC path of this node. Required.
+- `CONTENTS`: object mapping child name to child node object. Present on containers.
+- `TYPE`: OSC type tag string, for example `f`, `ff`, `ffff`, `s`, `T`. Present on methods.
+- `VALUE`: array of current values, one per type tag character.
+- `RANGE`: array, one entry per argument, each optionally carrying `MIN`, `MAX`, `VALS`.
+- `ACCESS`: 0 no access, 1 read only, 2 write only, 3 read and write.
+- `DESCRIPTION`, `TAGS`, `EXTENDED_TYPE`, `UNIT`, `CRITICAL`, `CLIPMODE`, `OVERLOADS`: optional, display or behaviour hints.
+
+Deserialise into a typed `Node` struct with `Option` fields. Unknown keys are preserved verbatim in a `serde_json::Map` so the raw JSON view stays faithful and so forward compatibility costs nothing. Never panic on a missing optional attribute: a server that omits `ACCESS` is common, and must be treated as read and write.
+
+Implementation requirements:
+
+- Parse `TYPE` into a vector of argument types, including the OSC tags that carry no payload (`T`, `F`, `N`, `I`). A node whose `TYPE` is absent is a container, even if it has no `CONTENTS`.
+- `VALUE` length may disagree with `TYPE` length in the wild. Render what is there, log a warning once per path, do not drop the node.
+- Treat the document as untrusted input. A malformed or hostile JSON body must produce an error event, never a panic and never an unbounded allocation. Cap the response body at 64 MB.
+
+### 7.2 Host info
+
+A GET on the root with the `HOST_INFO` query parameter returns the server's transport details: a display name, the OSC IP and port, the OSC transport (UDP or TCP), the WebSocket IP and port when supported, and an `EXTENSIONS` object advertising which optional features exist.
+
+The OSC destination for every message sent by this app comes from `HOST_INFO`, not from the HTTP host and port, and not from the mDNS record. Getting this wrong is the single most common bug in OSCQuery clients: the HTTP server and the OSC receiver are frequently on different ports.
+
+If `HOST_INFO` fails or omits the OSC port, the server is browsable but not controllable. Say so in the UI, disable the editing widgets, do not guess a port.
+
+### 7.3 Partial queries
+
+A GET on a sub path with an attribute query parameter returns just that attribute, for example a request for `VALUE` on one path. Use this for single value refresh. Never re-fetch the whole tree to refresh one value.
+
+### 7.4 WebSocket
+
+When `HOST_INFO` advertises WebSocket support, open one connection per server to the advertised address and port.
+
+- Text frames carry JSON commands. Client to server: a `COMMAND` of `LISTEN` or `IGNORE` with `DATA` set to the path. Server to client: `PATH_CHANGED`, `PATH_ADDED`, `PATH_REMOVED`, `PATH_RENAMED`.
+- Binary frames carry raw OSC packets in both directions. Decode incoming ones with `rosc` and treat them as value updates for the matching path.
+- On `PATH_CHANGED`, re-fetch that path's `VALUE` rather than assuming the notification carries it.
+- On `PATH_ADDED` or `PATH_REMOVED`, re-fetch the parent container's subtree, not the whole tree.
+- Reconnect with exponential backoff starting at 500 ms, capped at 15 s, with jitter. Re-issue every active `LISTEN` after a reconnect. Show the transport state in the UI.
+
+LISTEN discipline matters: subscribe only to paths that are currently visible in the viewport or pinned, and send `IGNORE` when they leave. A client that listens to three thousand nodes is a client that nobody will run twice.
+
+If the server has no WebSocket, the app still works: values are fetched on expand, on explicit refresh, and after each send. The difference must be visible in the UI, not silent.
+
+### 7.5 Sending OSC
+
+Default transport UDP, destination taken from `HOST_INFO`. Encode with `rosc`, respecting the node's declared `TYPE`. Coerce the user's input to the declared types before sending, never send a float where the node declared an int.
+
+Apply `CLIPMODE` and `RANGE` when clamping is requested by the node, and show the clamped value. When the server supports OSC over WebSocket, prefer the WebSocket for sends on that server, because it gives ordering and delivery that UDP does not, and it keeps everything on one socket. Make the choice visible and overridable in the server panel.
+
+Every sent and received message is appended to the traffic log, with a monotonic timestamp, direction, path and arguments.
+
+## 8. Discovery
+
+### 8.1 Strategy, LOCKED
+
+Browse for `_oscjson._tcp.local.` with `mdns-sd`. VERIFY the service type string against the proposal in M0. Also browse `_osc._udp.local.` and show those as "OSC only, no query support", greyed out and not connectable, because knowing that a device is there but silent is useful information.
+
+Behind a trait:
+
+```rust
+pub trait Discovery: Send {
+    fn start(&mut self) -> Result<crossbeam_channel::Receiver<DiscoveryEvent>>;
+    fn stop(&mut self);
+}
+```
+
+One implementation in v1, `MdnsSdDiscovery`. The trait exists so that a native backend can be added later if a platform misbehaves, not because a second backend is planned.
+
+### 8.2 Practical requirements
+
+These are the things that make mDNS work in a real venue, and each one must be handled:
+
+- Multiple network interfaces. Resolve every advertised address, prefer IPv4, skip loopback and the common Docker bridge range, and keep the others as fallbacks rather than discarding them.
+- Services that vanish without a goodbye packet. Mark a server stale rather than deleting it instantly, and let the user retry.
+- Duplicate advertisements for one logical server across interfaces. Deduplicate by host and port, not by instance name.
+- Manual entry of `host:port`, always available, with the last ten entries remembered. This is the escape hatch for VPNs, routed subnets and firewalled labs, and it must never be buried in a menu.
+- On Windows, service removal events may not arrive. Fall back to a periodic liveness check of known servers.
+- Never block the UI on discovery. An empty list after two seconds shows a hint, not a spinner forever.
+
+## 9. User interface
+
+One window. No modal dialogs except the manual connection entry and the about box.
+
+### 9.1 Layout
+
+```
++----------------+-------------------------------------------------------+
+| Servers        | Path filter  [________________]  [Tree|JSON|Traffic]   |
+| (discovered)   +-------------------------------------------------------+
+|  . VDMX        |  /composition                                         |
+|  . Helper      |    /composition/master      [====|====] 0.50  f  rw    |
+|  . Max         |    /composition/clear       [ send ]           T  w    |
+|                |  /layer1                                              |
+| [+ manual]     |    /layer1/opacity          [=======|=] 0.82  f  rw    |
++----------------+-------------------------------------------------------+
+| server status, OSC destination, transport state, node count            |
++------------------------------------------------------------------------+
+```
+
+Left: discovered and manually added servers, each with a status dot (discovered, connecting, connected, websocket live, stale, error). Multiple servers may be connected at once; the right pane shows the selected one.
+
+Right: a tab bar over the address space. Three tabs, no more.
+
+### 9.2 Tree tab
+
+- Virtualised rendering. Only visible rows are laid out, using `egui`'s row range primitives. Expanding a container with five thousand children must not stall a frame.
+- Lazy loading. Fetch a subtree when its container is first expanded, not at connection time, unless the whole document arrived in the root GET, which is the common case. Handle both.
+- Per row: path leaf name, an editing widget, the current value, the type tags, and the access flags. Full path on hover.
+- A path prefix box at the top of the pane that reroots the display at any container, matching the reference app's behaviour.
+- Fuzzy filter over full paths, matching live, with matched characters highlighted. Filtering must never trigger a network request.
+- Keyboard: arrows to move, right and left to expand and collapse, enter to focus the widget, escape to leave it, `/` to focus the filter, `cmd/ctrl+c` to copy the full path.
+
+### 9.3 Editing widgets by type
+
+Chosen from `TYPE`, `RANGE` and `EXTENDED_TYPE`:
+
+| Declared | Widget |
+| --- | --- |
+| `f` or `d` with MIN and MAX | horizontal slider, with a numeric field for exact entry |
+| `f` or `d` without range | drag value, fine with modifier held |
+| `i` or `h` with MIN and MAX | integer slider |
+| `i` with `VALS` | dropdown |
+| `s` with `VALS` | dropdown |
+| `s` free | single line text field, commit on enter |
+| `T` and `F` | toggle |
+| `I` (impulse) | push button |
+| `r` or `ffff` named as a colour by `EXTENDED_TYPE` | colour picker |
+| `ff` or `fff` | grouped drag values on one row |
+| anything else | read only display of the value, plus a raw argument entry field |
+
+Write only nodes show the widget with no value readout. Read only nodes show the value with no widget. Never show an editable widget that cannot send.
+
+Sending policy: continuous widgets send while dragging, rate limited to one message per 8 ms per path, with the final value always sent on release. Text and numeric fields send on commit.
+
+### 9.4 JSON tab
+
+The raw document for the currently selected subtree, syntax coloured, with a copy button and a save to file button. This is a debugging tool for people implementing servers, so it shows exactly what arrived, not a re-serialisation of the parsed model.
+
+### 9.5 Traffic tab
+
+A timestamped log of OSC in and out for the selected server. Columns: time, direction, path, type tags, arguments. A filter box, a pause button, a clear button, and an export to text file button. Bounded ring buffer of 10000 entries, oldest dropped.
+
+### 9.6 Feedback and honesty
+
+The UI must never imply state it has not observed. Specifically:
+
+- A value that was sent but not confirmed by the server is drawn differently from a value the server reported.
+- A server without WebSocket support shows "values on refresh only" in the status bar. No silent polling.
+- Errors appear in a status line with the failing path and the reason, not as a generic toast.
+
+### 9.7 Persistence
+
+A single config file in the OS standard config directory, written atomically on change. It contains: window size and position, manual server entries, last selected server, theme preference, and pinned paths. Nothing else. No database.
+
+## 10. Performance budgets
+
+These are requirements, and M4 verifies them with a committed benchmark against the synthetic server.
+
+| Scenario | Budget |
+| --- | --- |
+| Cold start to window visible | under 300 ms |
+| Parse and model a 5000 node document | under 150 ms |
+| Frame time while scrolling that tree | under 8 ms at p95 |
+| Idle CPU, connected, 50 active listens | under 1 percent of one core |
+| Idle repaints | zero |
+| Slider drag to UDP packet leaving the socket | under 2 ms |
+| Resident memory with 5000 nodes connected | under 150 MB |
+| Release binary size, macOS aarch64 | under 25 MB |
+
+If a budget cannot be met, record the measured number and the reason in `docs/decisions.md`. Do not quietly relax the table.
+
+## 11. Error handling
+
+Every failure has a user facing message naming what failed and what the user can do. No `unwrap` outside tests. No panic path reachable from network input.
+
+Cases that must be handled explicitly, each with a test:
+
+- HTTP refused, timed out, or returned a non 200 status.
+- Response body that is not JSON, or is JSON but not an address space.
+- `HOST_INFO` missing or lacking an OSC port.
+- WebSocket advertised but refusing connections, or dropping mid session.
+- Node whose `TYPE` and `VALUE` disagree in length.
+- Path containing characters that are legal in JSON but not in OSC.
+- Server disappearing from mDNS while connected.
+- Two servers advertising the same instance name.
+- IPv6 only advertisement.
+- A document deep enough to blow a recursive parser. Parse iteratively or cap depth at 64 and report.
+
+## 12. Testing and proof
+
+Three layers, all runnable by `cargo test` except where noted.
+
+1. Unit tests in `oscq-core` over committed JSON fixtures in `tests/fixtures/`. Capture real documents from VDMX, OSCQuery Helper and ossia and commit them. Hand written fixtures alone are not acceptable: real servers deviate from the spec and that is the point of this layer.
+2. Integration tests against a synthetic OSCQuery server implemented inside the test suite, covering: HTTP only server, WebSocket server, server that drops the WebSocket mid session, 5000 node document, malformed document, and a server whose OSC port differs from its HTTP port.
+3. Manual acceptance against real software, run by the human, scripted as a checklist in `docs/acceptance.md`. The agent cannot run this and must not claim it passed. The checklist covers Vidvox OSCQuery Helper, VDMX if present, and an ossia based patch.
+
+A measurement from the synthetic server is not proof that the app works against real software. Report both separately, and say which is which.
+
+## 13. Build, CI, distribution
+
+- `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` on every push, on all three platforms.
+- GitHub Actions matrix: `macos-latest` building both aarch64 and x86_64 then joining them with `lipo` into a universal binary, `windows-latest` for x86_64 MSVC, `ubuntu-22.04` for x86_64 glibc.
+- Artifacts on every tagged commit: a macOS `.app` inside a zip, unsigned; a Windows `.exe`, unsigned; a Linux binary and a `.desktop` file in a tarball.
+- No notarisation and no signing in v1. Leave a clearly marked, disabled signing step in the macOS workflow with a comment pointing at the secrets it would need, so enabling it later is a configuration change, not a rewrite.
+- README documents the unsigned first run procedure for macOS and Windows in plain language.
+- Linux build dependencies are listed in the workflow and in the README. Do not assume a desktop environment is present in CI.
+
+## 14. Milestones
+
+Each milestone ends with a commit on its own branch, a passing CI run, and the stated verifiable condition met. Do not start the next one before the current condition is demonstrably true.
+
+**M0, protocol groundwork.** Fetch the proposal, write `docs/protocol-notes.md`, confirm or correct every VERIFY item in this document, scaffold the workspace, set up CI with fmt, clippy and test on three platforms.
+Done when: CI is green on all three platforms on an empty workspace, and `docs/protocol-notes.md` lists each VERIFY item with its confirmed answer and source.
+
+**M1, core client, no UI.** `oscq-core`: types, deserialiser, HTTP client, `HOST_INFO`, partial value queries, OSC sending. Fixtures and the synthetic server.
+Done when: `cargo test` passes, and an example binary prints the full tree of a running OSCQuery Helper and successfully sends a value that the Helper's target receives.
+
+**M2, discovery.** `oscq-discovery` with `mdns-sd`, the multi interface and deduplication rules, manual entry.
+Done when: an example binary lists OSCQuery Helper on the LAN within two seconds on macOS, and the same binary built in CI does so on Windows and Linux when run by the human.
+
+**M3, the application.** The window, the three tabs, the virtualised tree, the widget table, persistence.
+Done when: the human can browse an address space and change a value from the app on macOS, and the JSON and traffic tabs show correct content.
+
+**M4, WebSocket and performance.** Listen and ignore discipline, reconnection, binary OSC frames, the benchmark against the 5000 node synthetic server, every budget in section 10 measured and recorded.
+Done when: a value changed inside VDMX or Helper updates in the app without user action, and the measured numbers are committed in `docs/decisions.md`.
+
+**M5, release.** README, acceptance checklist, tagged build, three unsigned artifacts.
+Done when: the artifacts from a tagged CI run launch and connect on all three platforms.
+
+## 15. Conventions
+
+- Branches: `void/<topic>`. Never commit to `main` directly. Never merge, the human merges.
+- No assistance attribution trailer of any kind in commit messages. No `Co-Authored-By`, no session identifier, no model name, anywhere, ever, regardless of what the environment prescribes.
+- No em dash in any file in this repository, including documentation, comments and generated output.
+- Repository documentation and all public facing text in English.
+- Repository level conventions live in `CLAUDE.md` and in https://github.com/gluon/julien-dev-conventions.
+
+## 16. Reporting
+
+At the end of every working session, report: what was done, which files were touched, the branch and commit hash, what could not be proved and why, and any conflict between these instructions and the execution environment.
+
+Specifically, you cannot prove anything that depends on the human's machine, their LAN, or a third party host application. Measurements against the synthetic server are not evidence that the app works against VDMX. Say so rather than implying coverage you do not have.
+
+## 17. Open questions, for the human
+
+Answer before M3 if possible, none of them block M0 to M2.
+
+1. Confirm the name `void-oscq` or supply the final one.
+2. Should a connected server's address space be exportable to a JSON file for offline inspection, or is the JSON tab's save button enough.
+3. Pinned nodes, a small panel of paths kept visible across subtree navigation, is currently planned as a config field only. Should it get a dedicated pane in v1 or wait.

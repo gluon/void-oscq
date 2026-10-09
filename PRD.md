@@ -2,7 +2,7 @@
 
 Status: v1 spec, locked for implementation.
 Audience: the engineer (human or agent) implementing the app from scratch.
-Working name: `void-oscq` (binary `void-oscq`, app display name "Void OSCQ"). Renaming is a single find and replace; do not redesign around a new name.
+Name: `void-oscq`, final. Binary `void-oscq`, app display name "Void OSCQ", repository `gluon/void-oscq`, private. The crate name `void-oscq` was free on crates.io at the time of writing; verify again before any publication.
 
 Read this whole document before writing code. Everything marked LOCKED is a decision, not a suggestion. Everything marked VERIFY must be checked against a primary source before you rely on it, and the result written into `docs/protocol-notes.md`.
 
@@ -395,8 +395,7 @@ Specifically, you cannot prove anything that depends on the human's machine, the
 
 ## 17. Open questions, for the human
 
-Answer before M3 if possible, none of them block M0 to M2.
+Answer before M3 if possible, neither blocks M0 to M2.
 
-1. Confirm the name `void-oscq` or supply the final one.
-2. Should a connected server's address space be exportable to a JSON file for offline inspection, or is the JSON tab's save button enough.
-3. Pinned nodes, a small panel of paths kept visible across subtree navigation, is currently planned as a config field only. Should it get a dedicated pane in v1 or wait.
+1. Should a connected server's address space be exportable to a JSON file for offline inspection, or is the JSON tab's save button enough.
+2. Pinned nodes, a small panel of paths kept visible across subtree navigation, is currently planned as a config field only. Should it get a dedicated pane in v1 or wait.
